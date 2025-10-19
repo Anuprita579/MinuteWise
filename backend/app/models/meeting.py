@@ -31,6 +31,10 @@ class ActionItem(BaseModel):
     priority: str = "medium"  # low, medium, high
     completed: bool = False
     due_date: Optional[datetime] = None
+    # Jira integration fields
+    jira_issue_key: Optional[str] = None
+    jira_issue_url: Optional[str] = None
+    jira_synced_at: Optional[datetime] = None
 
 class Meeting(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")

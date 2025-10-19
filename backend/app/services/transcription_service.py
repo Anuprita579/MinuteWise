@@ -6,6 +6,9 @@ from pathlib import Path
 import tempfile
 import subprocess
 import os
+from pydub import AudioSegment
+import wave
+import shutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,203 +16,278 @@ logger = logging.getLogger(__name__)
 class TranscriptionService:
     def __init__(self, model_name="base"):
         logger.info(f"Loading Whisper model: {model_name}")
-        # Use a larger model for better accuracy
-        # Consider: "small", "medium", "large", "large-v2", "large-v3"
         self.model = whisper.load_model(model_name)
         self.model_name = model_name
+        
+        # Check if FFmpeg is available
+        self.ffmpeg_available = self._check_ffmpeg()
+        if not self.ffmpeg_available:
+            logger.warning("FFmpeg not found. Audio conversion will be limited.")
 
-    def _preprocess_audio_ffmpeg(self, input_path: str) -> str:
+    def _check_ffmpeg(self) -> bool:
+        """Check if FFmpeg is available"""
+        try:
+            subprocess.run(['ffmpeg', '-version'], 
+                         capture_output=True, 
+                         check=True,
+                         timeout=5)
+            logger.info("FFmpeg is available")
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _normalize_path(self, file_path: str) -> str:
         """
-        Use FFmpeg to preprocess audio for better quality
-        This handles format conversion, noise reduction, and normalization
+        Normalize file path for Windows compatibility.
+        Converts relative paths to absolute paths.
+        """
+        path = Path(file_path)
+        
+        # Convert to absolute path
+        if not path.is_absolute():
+            path = path.resolve()
+        
+        # Ensure the path exists
+        if not path.exists():
+            raise FileNotFoundError(f"File does not exist: {path}")
+        
+        # Return as string with forward slashes (works better with Whisper)
+        return str(path).replace('\\', '/')
+
+    def _convert_to_valid_wav(self, input_path: str) -> str:
+        """
+        Convert any audio format to a valid WAV file that Whisper can process.
         """
         try:
-            # Create temporary file for processed audio
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(temp_dir, f"processed_{os.path.basename(input_path)}.wav")
+            # Normalize input path
+            input_path = self._normalize_path(input_path)
             
-            # FFmpeg command for audio preprocessing
+            # Create temp file in the same directory as input (avoid path issues)
+            input_dir = Path(input_path).parent
+            temp_path = input_dir / f"converted_{Path(input_path).name}"
+            temp_path_str = str(temp_path)
+            
+            logger.info(f"Converting audio file: {input_path} -> {temp_path_str}")
+            
+            # Method 1: Try with pydub first
+            try:
+                logger.info("Attempting conversion with pydub...")
+                audio = AudioSegment.from_file(input_path)
+                
+                # Convert to mono
+                if audio.channels > 1:
+                    audio = audio.set_channels(1)
+                    logger.info("Converted to mono")
+                
+                # Set to 16kHz sample rate
+                if audio.frame_rate != 16000:
+                    audio = audio.set_frame_rate(16000)
+                    logger.info(f"Resampled from {audio.frame_rate}Hz to 16000Hz")
+                
+                # Export as proper WAV file
+                audio.export(
+                    temp_path_str,
+                    format="wav",
+                    parameters=["-acodec", "pcm_s16le"]
+                )
+                
+                logger.info(f"Audio converted successfully with pydub: {temp_path_str}")
+                return temp_path_str
+                
+            except Exception as pydub_error:
+                logger.warning(f"Pydub conversion failed: {pydub_error}")
+                
+                # Method 2: Try FFmpeg if available
+                if self.ffmpeg_available:
+                    logger.info("Attempting conversion with FFmpeg...")
+                    return self._convert_with_ffmpeg(input_path, temp_path_str)
+                else:
+                    raise RuntimeError("Neither pydub nor FFmpeg could convert the audio file. "
+                                     "Please install FFmpeg: https://ffmpeg.org/download.html")
+                
+        except Exception as e:
+            logger.error(f"Audio conversion failed: {e}")
+            raise RuntimeError(f"Audio conversion failed: {e}")
+
+    def _convert_with_ffmpeg(self, input_path: str, output_path: str) -> str:
+        """Use FFmpeg to convert audio"""
+        try:
             cmd = [
-                'ffmpeg', '-y',  # -y to overwrite output file
+                'ffmpeg', '-y',
                 '-i', input_path,
-                '-ar', '16000',  # Resample to 16kHz (Whisper's native sample rate)
-                '-ac', '1',      # Convert to mono
-                '-c:a', 'pcm_s16le',  # Use 16-bit PCM encoding
-                '-af', 'highpass=f=80,lowpass=f=8000',  # Basic filtering to remove noise
-                temp_path
+                '-ar', '16000',
+                '-ac', '1',
+                '-c:a', 'pcm_s16le',
+                '-f', 'wav',
+                output_path
             ]
             
-            # Run FFmpeg
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.info(f"Audio preprocessed with FFmpeg: {input_path} -> {temp_path}")
-            return temp_path
+            result = subprocess.run(
+                cmd, 
+                capture_output=True, 
+                text=True, 
+                check=True,
+                timeout=30
+            )
+            
+            logger.info(f"Audio converted with FFmpeg: {output_path}")
+            return output_path
             
         except subprocess.CalledProcessError as e:
-            logger.warning(f"FFmpeg preprocessing failed: {e}")
-            logger.warning(f"FFmpeg stderr: {e.stderr}")
-            return input_path  # Fallback to original file
-        except FileNotFoundError:
-            logger.warning("FFmpeg not found, using original audio preprocessing")
-            return input_path
+            logger.error(f"FFmpeg conversion failed: {e.stderr}")
+            raise RuntimeError(f"FFmpeg conversion failed: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("FFmpeg conversion timed out")
 
-    def _preprocess_audio_soundfile(self, file_path: str) -> np.ndarray:
-        """
-        Preprocess audio using soundfile with improved quality
-        """
+    def _validate_wav_file(self, file_path: str) -> bool:
+        """Validate if a file is a proper WAV file"""
         try:
-            # Load the audio file
-            data, samplerate = sf.read(file_path)
-            logger.info(f"Original audio: sr={samplerate}, shape={data.shape}, dtype={data.dtype}")
-
-            # Convert to mono if stereo
-            if data.ndim > 1:
-                data = np.mean(data, axis=1)
-                logger.info("Converted stereo to mono")
-
-            # Resample to 16kHz if needed (Whisper's native sample rate)
-            if samplerate != 16000:
-                # Simple resampling (you might want to use librosa for better quality)
-                target_length = int(len(data) * 16000 / samplerate)
-                data = np.interp(
-                    np.linspace(0, len(data), target_length),
-                    np.arange(len(data)),
-                    data
-                )
-                logger.info(f"Resampled from {samplerate}Hz to 16000Hz")
-
-            # Normalize audio to [-1, 1] range
-            if np.max(np.abs(data)) > 0:
-                data = data / np.max(np.abs(data))
-                logger.info("Normalized audio amplitude")
-
-            # Convert to float32
-            audio = data.astype(np.float32)
-            
-            logger.info(f"Processed audio shape: {audio.shape}, dtype: {audio.dtype}")
-            return audio
-
+            file_path = self._normalize_path(file_path)
+            with wave.open(file_path, 'rb') as wav_file:
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                framerate = wav_file.getframerate()
+                nframes = wav_file.getnframes()
+                
+                logger.info(f"WAV validation: channels={channels}, "
+                          f"sample_width={sample_width}, framerate={framerate}, "
+                          f"frames={nframes}")
+                
+                return nframes > 0
         except Exception as e:
-            logger.error(f"Audio preprocessing error: {e}")
-            raise RuntimeError(f"Audio preprocessing error: {e}")
+            logger.warning(f"WAV validation failed: {e}")
+            return False
 
     def transcribe_audio(self, file_path: str) -> str:
         """
-        Transcribe audio with improved preprocessing and settings
+        Transcribe audio with automatic format conversion and path normalization
         """
-        processed_path = None
+        converted_path = None
         try:
             logger.info(f"Starting transcription for: {file_path}")
             
-            # Check if file exists
-            if not Path(file_path).exists():
-                raise FileNotFoundError(f"Audio file not found: {file_path}")
-
-            # Method 1: Try FFmpeg preprocessing first (better quality)
-            processed_path = self._preprocess_audio_ffmpeg(file_path)
+            # Normalize the path FIRST
+            try:
+                normalized_path = self._normalize_path(file_path)
+                logger.info(f"Normalized path: {normalized_path}")
+            except FileNotFoundError as e:
+                logger.error(f"File not found: {e}")
+                raise
             
-            # Transcribe using Whisper with optimized settings
-            logger.info("Starting Whisper transcription...")
+            # Get file size
+            file_size = Path(normalized_path).stat().st_size
+            logger.info(f"Audio file size: {file_size} bytes")
+            
+            if file_size < 100:
+                raise RuntimeError("Audio file too small to be valid")
+
+            # Check if it's a valid WAV file
+            is_valid_wav = self._validate_wav_file(normalized_path)
+            
+            if not is_valid_wav:
+                logger.info("File is not a valid WAV, converting...")
+                converted_path = self._convert_to_valid_wav(normalized_path)
+                file_to_process = converted_path
+            else:
+                logger.info("File is a valid WAV")
+                file_to_process = normalized_path
+            
+            # Double-check the file exists before transcription
+            if not Path(file_to_process).exists():
+                raise FileNotFoundError(f"Processed file not found: {file_to_process}")
+            
+            # Transcribe using Whisper
+            logger.info(f"Starting Whisper transcription on: {file_to_process}")
             
             result = self.model.transcribe(
-                processed_path,
-                language=None,  # Auto-detect language (remove "en" constraint)
-                fp16=False,     # Use fp32 for better accuracy
-                beam_size=5,    # Use beam search for better results
-                best_of=5,      # Generate multiple candidates and pick the best
-                temperature=0.0,  # Use greedy decoding for consistency
-                compression_ratio_threshold=2.4,  # Filter out low-quality segments
-                logprob_threshold=-1.0,  # Filter out low-confidence segments
-                no_speech_threshold=0.6,  # Adjust silence detection
-                condition_on_previous_text=True,  # Use context from previous segments
-                initial_prompt="This is a conversation between people in a meeting or casual discussion.",  # Provide context
-                word_timestamps=False  # Disable for faster processing
+                file_to_process,
+                language=None,
+                fp16=False,
+                beam_size=5,
+                best_of=5,
+                temperature=0.0,
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=True,
+                initial_prompt="This is a conversation between people in a meeting or casual discussion.",
+                word_timestamps=False
             )
             
             transcript = result["text"].strip()
             
-            # Log detected language and confidence
             if "language" in result:
                 logger.info(f"Detected language: {result['language']}")
             
             logger.info(f"Transcription completed. Length: {len(transcript)} characters")
-            logger.info(f"Transcript preview: {transcript[:100]}...")
+            
+            if transcript:
+                logger.info(f"Transcript preview: {transcript[:100]}...")
+            else:
+                logger.warning("Transcript is empty!")
             
             return transcript
 
+        except FileNotFoundError as e:
+            logger.error(f"File not found error: {e}")
+            raise RuntimeError(f"File not found: {str(e)}")
         except Exception as e:
-            logger.error(f"Transcription error for {file_path}: {e}")
-            
-            # Fallback: Try with soundfile preprocessing
-            try:
-                logger.info("Trying fallback method with soundfile preprocessing...")
-                audio = self._preprocess_audio_soundfile(file_path)
-                
-                result = self.model.transcribe(
-                    audio,
-                    language=None,
-                    fp16=False,
-                    temperature=0.0,
-                    beam_size=1,  # Simpler beam search for fallback
-                    best_of=1
-                )
-                
-                transcript = result["text"].strip()
-                logger.info(f"Fallback transcription completed: {len(transcript)} characters")
-                return transcript
-                
-            except Exception as fallback_error:
-                logger.error(f"Fallback transcription also failed: {fallback_error}")
-                raise RuntimeError(f"Transcription failed: {e}. Fallback also failed: {fallback_error}")
+            logger.error(f"Transcription error for {file_path}: {e}", exc_info=True)
+            raise RuntimeError(f"Transcription failed: {str(e)}")
         
         finally:
-            # Clean up processed file if it was created by FFmpeg
-            if processed_path and processed_path != file_path and Path(processed_path).exists():
+            # Clean up converted file
+            if converted_path and Path(converted_path).exists():
                 try:
-                    os.remove(processed_path)
-                    logger.debug(f"Cleaned up processed file: {processed_path}")
+                    os.remove(converted_path)
+                    logger.debug(f"Cleaned up converted file: {converted_path}")
                 except Exception as e:
-                    logger.warning(f"Failed to clean up processed file: {e}")
+                    logger.warning(f"Failed to clean up converted file: {e}")
 
     def transcribe_audio_with_segments(self, file_path: str) -> dict:
-        """
-        Transcribe audio and return detailed segment information
-        Useful for debugging and understanding what Whisper detected
-        """
+        """Transcribe audio and return detailed segment information"""
+        converted_path = None
         try:
             logger.info(f"Transcribing with segments: {file_path}")
             
-            processed_path = self._preprocess_audio_ffmpeg(file_path)
+            # Normalize path
+            normalized_path = self._normalize_path(file_path)
+            
+            # Validate and convert if needed
+            if not self._validate_wav_file(normalized_path):
+                converted_path = self._convert_to_valid_wav(normalized_path)
+                file_to_process = converted_path
+            else:
+                file_to_process = normalized_path
             
             result = self.model.transcribe(
-                processed_path,
+                file_to_process,
                 language=None,
                 fp16=False,
                 beam_size=5,
                 temperature=0.0,
-                word_timestamps=True,  # Enable word-level timestamps
-                verbose=True  # Show progress
+                word_timestamps=True,
+                verbose=True
             )
-            
-            # Clean up
-            if processed_path != file_path and Path(processed_path).exists():
-                os.remove(processed_path)
             
             return result
             
         except Exception as e:
             logger.error(f"Segment transcription error: {e}")
             raise RuntimeError(f"Segment transcription error: {e}")
+        finally:
+            if converted_path and Path(converted_path).exists():
+                os.remove(converted_path)
 
 
-# Singleton accessor with configurable model
+# Singleton accessor
 _transcription_service = None
 
-def get_transcription_service(model_name="small"):  # Changed default to "small" for better accuracy
+def get_transcription_service(model_name="small"):
     global _transcription_service
     if _transcription_service is None:
         _transcription_service = TranscriptionService(model_name)
     return _transcription_service
 
-# Alternative function to force reload with different model
 def get_transcription_service_with_model(model_name="small"):
     return TranscriptionService(model_name)

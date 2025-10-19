@@ -187,7 +187,7 @@ function AudioUpload() {
                   <p className="pl-1">or drag and drop</p>
                 </div>
                 <p className="text-xs text-gray-500">
-                  WAV, MP3, M4A, AAC, OGG, WebM, MP4 up to 100MB
+                  WAV up to 100MB
                 </p>
               </div>
             </div>
@@ -240,7 +240,7 @@ function AudioUpload() {
         <div className="mt-4 pt-4 border-t border-blue-200">
           <h4 className="font-semibold text-blue-900 mb-1">Supported Formats:</h4>
           <p className="text-xs text-blue-700">
-            WAV, MP3, AAC, OGG, WebM, MP4
+            WAV
           </p>
         </div>
       </div>

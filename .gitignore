@@ -10,6 +10,7 @@ lerna-debug.log*
 node_modules
 backend/node_modules
 frontend/node_modules
+mobile/node_modules
 dist
 dist-ssr
 *.local
@@ -27,6 +28,8 @@ dist-ssr
 
 backend/.env
 frontend/.env
+mobile/.env
 
 backend/venv
 backend/app/__pycache__
+backend/uploads

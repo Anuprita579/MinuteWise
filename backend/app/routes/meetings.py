@@ -1,7 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, Request, Query
+from fastapi import APIRouter, HTTPException, Depends, Request, Query, BackgroundTasks
 from typing import List, Optional
 from bson import ObjectId
 from datetime import datetime
+import httpx
+import aiofiles
+from pathlib import Path
 
 from ..models.meeting import Meeting
 from ..models.action_item import ActionItem, ActionItemCreate, ActionItemUpdate
@@ -214,3 +217,96 @@ async def delete_meeting(
         return {"message": "Meeting deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting meeting: {str(e)}")
+    
+@router.post("/{meeting_id}/process-recording")
+async def process_meeting_recording(
+    meeting_id: str,
+    request: Request,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user)
+):
+    """Process Jibri recording from URL"""
+    try:
+        import httpx
+        from pathlib import Path
+        
+        # Verify meeting exists and user has access
+        meeting = await request.app.mongodb.meetings.find_one({"_id": ObjectId(meeting_id)})
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        
+        has_access = (
+            meeting["created_by"] == ObjectId(current_user["_id"]) or
+            any(p.get("user_id") == ObjectId(current_user["_id"]) 
+                for p in meeting.get("participants", []))
+        )
+        
+        if not has_access:
+            raise HTTPException(status_code=403, detail="Access denied")
+        
+        recording_url = payload.get("recording_url")
+        if not recording_url:
+            raise HTTPException(status_code=400, detail="recording_url is required")
+        
+        logger.info(f"Processing recording for meeting {meeting_id} from URL: {recording_url}")
+        
+        # Update status to processing
+        await request.app.mongodb.meetings.update_one(
+            {"_id": ObjectId(meeting_id)},
+            {"$set": {"status": "processing", "recording_url": recording_url}}
+        )
+        
+        # Download and process in background
+        async def download_and_process():
+            temp_path = None
+            try:
+                # Download recording
+                upload_dir = Path("uploads")
+                upload_dir.mkdir(exist_ok=True)
+                
+                timestamp = datetime.utcnow().timestamp()
+                temp_path = upload_dir / f"jibri_recording_{timestamp}.mp4"
+                
+                logger.info(f"Downloading recording to {temp_path}")
+                
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    async with client.stream('GET', recording_url) as response:
+                        response.raise_for_status()
+                        
+                        async with aiofiles.open(temp_path, 'wb') as f:
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                await f.write(chunk)
+                
+                logger.info(f"Download complete: {temp_path.stat().st_size} bytes")
+                
+                # Process using existing pipeline
+                await process_audio_file(request.app.mongodb, meeting_id, str(temp_path))
+                
+            except Exception as e:
+                logger.error(f"Recording processing failed: {e}")
+                await request.app.mongodb.meetings.update_one(
+                    {"_id": ObjectId(meeting_id)},
+                    {"$set": {"status": "failed", "error": str(e)}}
+                )
+            finally:
+                # Cleanup
+                if temp_path and temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup {temp_path}: {e}")
+        
+        background_tasks.add_task(download_and_process)
+        
+        return {
+            "message": "Recording processing started",
+            "meeting_id": meeting_id,
+            "status": "processing"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error initiating recording processing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

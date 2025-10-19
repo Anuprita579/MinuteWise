@@ -5,9 +5,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 from dotenv import load_dotenv
 
-from app.routes import auth, meetings, transcription
-
 load_dotenv()
+
+from app.routes import auth, meetings, transcription, jira, email
 
 app = FastAPI(
     title="Meeting Transcription API",
@@ -47,9 +47,18 @@ async def health_check():
     return {"status": "healthy", "message": "Meeting Transcription API is running"}
 
 # Include routers
-app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
-app.include_router(meetings.router, prefix="/api/meetings", tags=["Meetings"])
-app.include_router(transcription.router, prefix="/api/transcription", tags=["Transcription"])
+# app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+# app.include_router(meetings.router, prefix="/api/meetings", tags=["Meetings"])
+# app.include_router(transcription.router, prefix="/api/transcription", tags=["Transcription"])
+# app.include_router(jira.router, prefix="/api/jira", tags=["jira"]) 
+# app.include_router(email.router, prefix="/api/email", tags=["email"])
+app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
+app.include_router(meetings.router, prefix="/meetings", tags=["Meetings"])
+app.include_router(transcription.router, prefix="/transcription", tags=["Transcription"])
+app.include_router(jira.router, prefix="/jira", tags=["jira"]) 
+app.include_router(email.router, prefix="/email", tags=["email"])
+
+
 
 if __name__ == "__main__":
     import uvicorn
