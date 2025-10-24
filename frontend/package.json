@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@jitsi/react-sdk": "^1.4.4",
+    "@supabase/supabase-js": "^2.75.1",
     "@tailwindcss/vite": "^4.1.11",
     "axios": "^1.11.0",
     "lucide-react": "^0.539.0",

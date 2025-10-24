@@ -1,15 +1,14 @@
-import { useState, useEffect, createContext, useContext } from 'react';
-import { api } from '../services/api';
+// frontend/src/hooks/useAuth.jsx
 
-// Auth Context
+import { useState, useEffect, createContext, useContext } from 'react';
+import { supabase, supabaseHelpers } from '../services/supabaseService';
+
 const AuthContext = createContext();
 
-// Auth Provider Component
 export const AuthProvider = ({ children }) => {
   const auth = useProvideAuth();
   return <AuthContext.Provider value={auth}>{children}</AuthContext.Provider>;
 };
-
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
@@ -19,64 +18,39 @@ export const useAuth = () => {
   return context;
 };
 
-// Main auth hook logic
 const useProvideAuth = () => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Initialize auth state on mount
   useEffect(() => {
-    checkAuthState();
+    // Check active sessions and sets the user
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    // Listen for changes on auth state (login, logout, etc.)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      setLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  const checkAuthState = async () => {
-    try {
-      const token = sessionStorage.getItem('token');
-      if (!token) {
-        setLoading(false);
-        return;
-      }
-
-      // Set token in API headers
-      api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
-      
-      // Verify token with backend
-      const response = await api.get('/auth/me');
-      setUser(response.data);
-    } catch (error) {
-      console.error('Auth check failed:', error);
-      // Clear invalid token
-      sessionStorage.removeItem('token');
-      delete api.defaults.headers.common['Authorization'];
-      setError('Session expired');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const loginWithGoogle = async (googleToken) => {
+  const loginWithGoogle = async () => {
     try {
       setLoading(true);
       setError(null);
-
-      const response = await api.post('/auth/google', {
-        token: googleToken
-      });
-
-      const { token, user } = response.data;
-
-      // Store token
-      sessionStorage.setItem('token', token);
+      const { error } = await supabaseHelpers.signInWithGoogle();
       
-      // Set token in API headers
-      api.defaults.headers.common['Authorization'] = `Bearer ${token}`;
+      if (error) throw error;
       
-      setUser(user);
-      return { success: true, user };
+      return { success: true };
     } catch (error) {
       console.error('Google login failed:', error);
-      const message = error.response?.data?.detail || 'Login failed';
+      const message = error.message || 'Login failed';
       setError(message);
       return { success: false, error: message };
     } finally {
@@ -84,24 +58,29 @@ const useProvideAuth = () => {
     }
   };
 
-  const logout = () => {
-    // Clear token from storage and API headers
-    sessionStorage.removeItem('token');
-    delete api.defaults.headers.common['Authorization'];
-    
-    // Clear user state
-    setUser(null);
-    setError(null);
+  const logout = async () => {
+    try {
+      const { error } = await supabaseHelpers.signOut();
+      if (error) throw error;
+      
+      setUser(null);
+      setError(null);
+    } catch (error) {
+      console.error('Logout failed:', error);
+      setError(error.message);
+    }
   };
 
   const refreshUser = async () => {
     try {
-      const response = await api.get('/auth/me');
-      setUser(response.data);
-      return response.data;
+      const { user, error } = await supabaseHelpers.getCurrentUser();
+      if (error) throw error;
+      
+      setUser(user);
+      return user;
     } catch (error) {
       console.error('Failed to refresh user:', error);
-      logout(); // Auto logout if refresh fails
+      logout();
       throw error;
     }
   };
@@ -113,7 +92,6 @@ const useProvideAuth = () => {
     isAuthenticated: !!user,
     loginWithGoogle,
     logout,
-    refreshUser,
-    checkAuthState
+    refreshUser
   };
 };

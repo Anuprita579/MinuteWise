@@ -1,3 +1,4 @@
+// src/services/supabaseService.js - FIXED VERSION
 import { supabase } from '../config/supabase';
 import { File } from 'expo-file-system';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
@@ -181,47 +182,79 @@ export const supabaseService = {
   },
 
   async deleteMeeting(meetingId) {
-    try {
-      console.log('🗑️ Deleting meeting:', meetingId);
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error('Not authenticated');
 
-      // Get meeting to find audio file path
-      const { data: meeting } = await supabase
+    try {
+      // First, get the meeting to find the audio file
+      const { data: meeting, error: fetchError } = await supabase
         .from('meetings')
         .select('audio_file_path')
         .eq('id', meetingId)
         .single();
 
-      // Delete from database (cascade deletes participants and action items)
-      const { error: dbError } = await supabase
+      if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
+
+      // Delete audio file from storage if exists
+      if (meeting?.audio_file_path) {
+        const { error: storageError } = await supabase.storage
+          .from('recordings')
+          .remove([meeting.audio_file_path]);
+        
+        if (storageError) {
+          console.error('Error deleting audio file:', storageError);
+        }
+      }
+
+      // Delete meeting (cascade will handle related records)
+      const { error: deleteError } = await supabase
         .from('meetings')
         .delete()
         .eq('id', meetingId);
 
-      if (dbError) throw dbError;
+      if (deleteError) throw deleteError;
 
-      // Delete audio file from storage
-      if (meeting?.audio_file_path) {
-        await this.deleteAudio(meeting.audio_file_path);
-      }
-
-      console.log('✅ Meeting deleted successfully');
       return { success: true };
     } catch (error) {
-      console.error('❌ Delete meeting error:', error);
-      throw error;
+      console.error('Error deleting meeting:', error);
+      return { error };
     }
   },
 
-  async addParticipants(meetingId, participants) {
+  // ✅ FIXED: Now accepts userId and sets first participant as admin
+  async addParticipants(meetingId, participants, creatorUserId) {
     try {
       console.log(`📝 Adding ${participants.length} participants to meeting`);
 
-      const participantRecords = participants.map(p => ({
-        meeting_id: meetingId,
-        name: p.name,
-        email: p.email,
-        user_id: p.user_id || null,
-      }));
+      // Get creator's email to match against participants
+      let creatorEmail = null;
+      if (creatorUserId) {
+        try {
+          const { data: { user } } = await supabase.auth.getUser();
+          creatorEmail = user?.email?.toLowerCase();
+          console.log('👤 Creator email:', creatorEmail);
+        } catch (error) {
+          console.warn('Could not get creator email:', error);
+        }
+      }
+
+      const participantRecords = participants.map((p, index) => {
+        // Check if this participant is the creator
+        const isCreator = creatorEmail && p.email?.toLowerCase() === creatorEmail;
+        
+        // First participant OR matching creator email should be admin
+        const role = (index === 0 || isCreator) ? 'admin' : 'user';
+        
+        console.log(`  - ${p.name} (${p.email}): ${role}${isCreator ? ' [creator]' : ''}`);
+
+        return {
+          meeting_id: meetingId,
+          name: p.name,
+          email: p.email,
+          user_id: isCreator ? creatorUserId : (p.user_id || null),
+          role: role, // ✅ NOW SETTING ROLE
+        };
+      });
 
       const { data, error } = await supabase
         .from('participants')
@@ -230,7 +263,7 @@ export const supabaseService = {
 
       if (error) throw error;
 
-      console.log('✅ Participants added');
+      console.log('✅ Participants added with roles');
       return data;
     } catch (error) {
       console.error('❌ Add participants error:', error);
@@ -311,6 +344,7 @@ export const supabaseService = {
     }
   },
 
+  // ✅ FIXED: Now passes userId to addParticipants
   async createMeetingWithParticipants(audioUri, title, participants, userId) {
     try {
       console.log('🚀 Starting complete meeting creation workflow');
@@ -329,11 +363,13 @@ export const supabaseService = {
         created_by: userId,
       });
 
-      // Step 3: Add participants
+      // Step 3: Add participants WITH ROLES ✅
       if (participants && participants.length > 0) {
-        console.log('Step 3: Adding participants...');
-        await this.addParticipants(meeting.id, participants);
+        console.log('Step 3: Adding participants with proper roles...');
+        await this.addParticipants(meeting.id, participants, userId); // ✅ Passing userId
       }
+
+      console.log('✅ Meeting creation workflow complete!');
 
       return {
         ...meeting,

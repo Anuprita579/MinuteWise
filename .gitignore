@@ -32,4 +32,7 @@ mobile/.env
 
 backend/venv
 backend/app/__pycache__
+backend/services/__pycache__
+backend/routes/__pycache__
+backend/__pycache__
 backend/uploads

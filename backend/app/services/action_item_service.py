@@ -1,527 +1,321 @@
-import spacy
 import re
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional
+from difflib import SequenceMatcher
 import logging
-from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+
 class ActionItemService:
     def __init__(self):
-        # Load spaCy model for advanced NLP
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            logger.warning("Please install spaCy English model: python -m spacy download en_core_web_sm")
-            self.nlp = None
-        
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        
-        # Comprehensive action verbs (industry-agnostic)
         self.action_verbs = {
-            'create', 'make', 'build', 'develop', 'design', 'implement', 'write', 'draft',
-            'complete', 'finish', 'finalize', 'prepare', 'setup', 'configure',
-            'review', 'check', 'verify', 'validate', 'test', 'inspect', 'audit', 'analyze',
-            'update', 'revise', 'modify', 'change', 'fix', 'repair', 'maintain', 'service',
-            'install', 'deploy', 'launch', 'release', 'deliver', 'ship',
-            'research', 'investigate', 'study', 'explore', 'examine',
-            'document', 'record', 'log', 'report', 'summarize',
-            'present', 'demo', 'showcase', 'demonstrate',
-            'schedule', 'plan', 'organize', 'coordinate', 'arrange',
-            'contact', 'call', 'email', 'reach out', 'follow up', 'notify',
-            'approve', 'sign off', 'authorize', 'confirm',
-            'train', 'teach', 'educate', 'mentor', 'guide',
-            'collect', 'gather', 'compile', 'assemble',
-            'process', 'handle', 'manage', 'oversee', 'monitor',
-            'clean', 'clear', 'remove', 'delete', 'archive',
-            'measure', 'calculate', 'estimate', 'assess', 'evaluate'
+            'doing', 'create', 'handle', 'update', 'review', 'manage', 'prepare',
+            'finalize', 'coordinate', 'organize', 'send', 'submit', 'deliver',
+            'working', 'develop', 'build', 'design', 'test', 'document', 'write',
+            'do', 'make', 'implement', 'complete', 'process', 'analyze', 'check'
         }
-        
-        # Assignment signal words
-        self.assignment_signals = {
-            'direct': ['you will', 'you do', 'you should', 'you need to', 'you have to'],
-            'passive': ['by', 'assigned to', 'handled by', 'done by'],
-            'imperative': ['please', 'can you', 'could you', 'would you']
-        }
-        
-        # Priority keywords
-        self.priority_keywords = {
-            'high': ['urgent', 'critical', 'asap', 'immediately', 'priority', 'important', 'emergency'],
-            'low': ['later', 'eventually', 'when possible', 'nice to have', 'if time permits', 'optional'],
-        }
-        
-        # Context stopwords for task cleaning
-        self.task_stopwords = {
-            'so', 'yeah', 'that', 'this', 'the', 'a', 'an', 'is', 'are', 'was', 'were',
-            'and', 'or', 'but', 'as', 'discussed', 'previous', 'meeting', 'also',
-            'for', 'to', 'in', 'on', 'at', 'from', 'with', 'about', 'of'
-        }
-    
-    async def extract_action_items(self, transcript: str) -> List[Dict]:
-        """Extract action items using advanced NLP and feature engineering"""
-        loop = asyncio.get_event_loop()
-        
-        def _extract():
-            try:
-                # Clean transcript
-                cleaned_text = self._clean_transcript(transcript)
-                logger.info(f"Cleaned transcript: '{cleaned_text}'")
-                
-                # Process with spaCy for linguistic features
-                if not self.nlp:
-                    return []
-                
-                doc = self.nlp(cleaned_text)
-                
-                # Extract person names
-                person_names = self._extract_entities(doc)
-                logger.info(f"Detected entities - Persons: {person_names}")
-                
-                # Split into sentences
-                sentences = [sent for sent in doc.sents]
-                logger.info(f"Processing {len(sentences)} sentences")
-                
-                action_items = []
-                seen_items = set()
-                
-                for sent in sentences:
-                    logger.info(f"Analyzing: '{sent.text}'")
-                    
-                    # Extract action items using multiple methods
-                    items = self._extract_from_sentence(sent, person_names)
-                    
-                    for item in items:
-                        # Create unique key
-                        key = f"{item['assignee'].lower()}:{item['text'].lower()}"
-                        
-                        if key not in seen_items and len(item['text'].split()) <= 6:  # Max 6 words
-                            seen_items.add(key)
-                            action_items.append(item)
-                            logger.info(f"✓ Extracted: {item['assignee'] or '[Unassigned]'} → {item['text']} (confidence: {item['confidence']:.2f})")
-                
-                # Sort by confidence and filter low-confidence items
-                action_items = [item for item in action_items if item['confidence'] > 0.3]
-                action_items.sort(key=lambda x: x['confidence'], reverse=True)
-                
-                logger.info(f"Final: {len(action_items)} action items extracted")
-                return action_items
-                
-            except Exception as e:
-                logger.error(f"Extraction failed: {str(e)}", exc_info=True)
-                return []
-        
-        try:
-            return await loop.run_in_executor(self.executor, _extract)
-        except Exception as e:
-            logger.error(f"Async extraction failed: {str(e)}")
+
+    def extract_action_items_with_participants(
+        self, 
+        transcript: str, 
+        participants: List[Dict]
+    ) -> List[Dict]:
+        """Extract action items from transcript"""
+        if not transcript:
             return []
-    
-    def _extract_entities(self, doc) -> Set[str]:
-        """Extract person names using NER"""
-        persons = set()
-        for ent in doc.ents:
-            if ent.label_ == "PERSON":
-                persons.add(ent.text)
         
-        # Additional pattern-based name detection
-        for token in doc:
-            if token.pos_ == "PROPN" and token.text[0].isupper():
-                # Filter out common false positives
-                if token.text not in {'Hi', 'Hello', 'Yes', 'Okay', 'Sir', 'Thank', 'We', 'So'}:
-                    persons.add(token.text)
+        participant_map = self._build_participant_map(participants)
+        action_items = self._extract_with_patterns(transcript, participant_map)
         
-        return persons
-    
-    def _extract_from_sentence(self, sent, person_names: Set[str]) -> List[Dict]:
-        """Extract action items from sentence using multiple methods"""
-        items = []
+        return action_items
+
+    def _build_participant_map(self, participants: List[Dict]) -> Dict:
+        """Build participant lookup map"""
+        participant_map = {
+            'by_full_name': {},
+            'by_first_name': {},
+            'by_last_name': {},
+            'all_names': [],
+            'all_participants': participants
+        }
         
-        # Method 1: Pattern-based extraction
-        items.extend(self._pattern_based_extraction(sent, person_names))
+        for p in participants:
+            name = p['name'].strip()
+            name_lower = name.lower()
+            
+            participant_map['by_full_name'][name_lower] = p
+            participant_map['all_names'].append(name_lower)
+            
+            name_parts = name.split()
+            if name_parts:
+                first_name = name_parts[0].lower()
+                participant_map['by_first_name'][first_name] = p
+                
+                if len(name_parts) > 1:
+                    last_name = name_parts[-1].lower()
+                    participant_map['by_last_name'][last_name] = p
         
-        # Method 2: Dependency parsing
-        items.extend(self._dependency_based_extraction(sent, person_names))
+        return participant_map
+
+    def _extract_with_patterns(self, transcript: str, participant_map: Dict) -> List[Dict]:
+        """Extract action items using pattern matching"""
+        action_items = []
+        seen_items = set()
         
-        # Method 3: Verb-noun phrase extraction
-        items.extend(self._verb_phrase_extraction(sent, person_names))
-        
-        return items
-    
-    def _pattern_based_extraction(self, sent, person_names: Set[str]) -> List[Dict]:
-        """Extract using enhanced patterns with confidence scoring"""
-        items = []
-        text = sent.text
-        
+        # Enhanced patterns with better handling of "and" connectors
         patterns = [
-            # "Name, you will be doing/working on X"
-            (r'(\w+),\s+you\s+will\s+be\s+(?:doing|working on)\s+(?:the\s+)?(.+?)(?:\s+and|\.|\,|$)', 0.95),
-            # "Name, you do/work on X"
-            (r'(\w+),?\s+you\s+(?:do|work on)\s+(?:the\s+)?(.+?)(?:\s+and|\.|\,|$)', 0.90),
-            # "X by Name"
-            (r'(.+?)\s+by\s+(\w+)(?:\.|\,|$)', 0.85),
-            # "Name will do/handle/work on X"
-            (r'(\w+)\s+will\s+(?:do|handle|work on|complete|prepare)\s+(?:the\s+)?(.+?)(?:\.|\,|$)', 0.80),
-            # "Name to do X"
-            (r'(\w+)\s+to\s+(?:do|handle|work on)\s+(?:the\s+)?(.+?)(?:\.|\,|$)', 0.75),
+            # "Name, you will handle/do/be doing X" - for first person in sentence and split sections
+            (r'^(\w+(?:\s+\w+)?),\s+you\s+will\s+(?:be\s+)?(?:handle|do|doing|working on)\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.99),
+            
+            # "Name will handle/do X" - with strict boundary
+            (r'^(\w+(?:\s+\w+)?)\s+will\s+(?:handle|do|be doing)\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+(?:\s+\w+)?(?:\s+will|\s+needs)|\.|$)', 0.98),
+            
+            # "Name, you need/should X"
+            (r'^(\w+(?:\s+\w+)?),\s+you\s+(?:need|should)\s+(?:to\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.98),
+            
+            # "Name, can you please X"
+            (r'^(\w+(?:\s+\w+)?),\s+can\s+you\s+(?:please\s+)?(.+?)(?:\s+and\s+\w+|\?|$)', 0.97),
+            
+            # "Name will be working on X"
+            (r'^(\w+(?:\s+\w+)?)\s+will\s+be\s+working\s+on\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.97),
+            
+            # "Name will VERB X" - comprehensive verb list
+            (r'^(\w+(?:\s+\w+)?)\s+will\s+(?:handle|create|manage|update|finalize|coordinate|organize|prepare|review|send|submit|deliver|check|verify|document|write|research|develop|build|design|test|schedule|contact|do|make|implement|complete|process|analyze)(?:\s+(?:the|a)\s+)?(.+?)(?:\s+and\s+\w+(?:\s+\w+)?(?:\s+will)|\.|$)', 0.96),
+            
+            # "Name needs to X"
+            (r'^(\w+(?:\s+\w+)?)\s+needs?\s+to\s+(?:be\s+)?(?:do\s+)?(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.95),
+            
+            # "Name should X"
+            (r'^(\w+(?:\s+\w+)?)\s+should\s+(?:be\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.94),
         ]
         
-        for pattern, base_confidence in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
-                groups = match.groups()
-                if len(groups) >= 2:
-                    # Determine assignee and task order
-                    if 'by' in pattern:
-                        task_raw, assignee_raw = groups[0], groups[1]
-                    else:
-                        assignee_raw, task_raw = groups[0], groups[1]
-                    
-                    assignee = self._clean_assignee(assignee_raw, person_names)
-                    task = self._extract_concise_task(task_raw, sent)
-                    
-                    if task and self._is_valid_task(task):
-                        confidence = self._calculate_confidence(sent, task, assignee, base_confidence)
-                        items.append({
-                            'text': task,
-                            'assignee': assignee or '',
-                            'priority': self._determine_priority(sent.text),
-                            'category': self._categorize_task(task),
-                            'completed': False,
-                            'source_sentence': sent.text,
-                            'confidence': confidence,
-                            'extraction_method': 'pattern'
-                        })
+        # Split transcript into processable chunks
+        # First, handle sentences that contain multiple assignments with "and"
+        sentences = self._smart_sentence_split(transcript)
         
-        return items
-    
-    def _dependency_based_extraction(self, sent, person_names: Set[str]) -> List[Dict]:
-        """Extract using dependency parsing for better accuracy"""
-        items = []
+        logger.info(f"Processing {len(sentences)} sentences")
         
-        # Find main verbs that are action verbs
-        for token in sent:
-            if token.pos_ == 'VERB' and token.lemma_ in self.action_verbs:
-                # Find the subject (who)
-                assignee = None
-                for child in token.children:
-                    if child.dep_ in ['nsubj', 'nsubjpass']:
-                        if child.text in person_names:
-                            assignee = child.text
-                        break
-                
-                # Find the object (what)
-                task_tokens = []
-                for child in token.children:
-                    if child.dep_ in ['dobj', 'pobj', 'attr']:
-                        task_tokens.append(child.text)
-                        # Get compound nouns
-                        for subchild in child.subtree:
-                            if subchild.dep_ in ['compound', 'amod'] and subchild.i < child.i:
-                                task_tokens.insert(0, subchild.text)
-                
-                if task_tokens:
-                    task = ' '.join([token.lemma_] + task_tokens)
-                    task = self._clean_task_text(task)
-                    
-                    if self._is_valid_task(task):
-                        confidence = self._calculate_confidence(sent, task, assignee, 0.70)
-                        items.append({
-                            'text': task,
-                            'assignee': assignee or '',
-                            'priority': self._determine_priority(sent.text),
-                            'category': self._categorize_task(task),
-                            'completed': False,
-                            'source_sentence': sent.text,
-                            'confidence': confidence,
-                            'extraction_method': 'dependency'
-                        })
-        
-        return items
-    
-    def _verb_phrase_extraction(self, sent, person_names: Set[str]) -> List[Dict]:
-        """Extract verb phrases as potential action items"""
-        items = []
-        
-        # Look for noun chunks preceded by action verbs
-        for chunk in sent.noun_chunks:
-            # Check if there's an action verb before this chunk
-            verb_token = None
-            for token in sent:
-                if token.pos_ == 'VERB' and token.lemma_ in self.action_verbs:
-                    if token.i < chunk.start and chunk.start - token.i <= 3:
-                        verb_token = token
-                        break
+        for sent in sentences:
+            # Skip noise
+            if any(skip in sent.lower() for skip in ['hello', 'thank you', 'end of', 'starting', 'yeah', 'alright team', 'let\'s go']):
+                continue
             
-            if verb_token:
-                # Check for assignee (person name before verb)
-                assignee = None
-                for token in sent:
-                    if token.text in person_names and token.i < verb_token.i:
-                        assignee = token.text
-                        break
+            # Try each pattern
+            for pattern, confidence in patterns:
+                matches = re.finditer(pattern, sent, re.IGNORECASE)
                 
-                task = f"{verb_token.lemma_} {chunk.text}"
-                task = self._clean_task_text(task)
-                
-                if self._is_valid_task(task) and len(task.split()) <= 4:
-                    confidence = self._calculate_confidence(sent, task, assignee, 0.60)
-                    items.append({
+                for match in matches:
+                    groups = match.groups()
+                    
+                    if len(groups) < 2:
+                        continue
+                    
+                    assignee_name = groups[0].strip()
+                    task = groups[1].strip()
+                    
+                    # Clean task
+                    task = self._clean_task(task, participant_map)
+                    
+                    # Validate task
+                    if not task or len(task) < 3:
+                        continue
+                    
+                    # Match participant
+                    matched = self._match_participant(assignee_name, participant_map)
+                    if not matched:
+                        continue
+                    
+                    # Validate task doesn't contain other names
+                    if self._contains_other_names(task, matched, participant_map):
+                        logger.info(f"Skipping - task contains other participant name: {task[:50]}")
+                        continue
+                    
+                    # Categorize
+                    category = self._categorize_task(task)
+                    
+                    # Create item key for dedup
+                    item_key = f"{matched['name'].lower()}:{task.lower()[:50]}"
+                    
+                    # Skip if already added (exact match)
+                    if item_key in seen_items:
+                        continue
+                    
+                    # Check for very similar items (98%+)
+                    if self._is_duplicate(task, matched['name'], action_items):
+                        continue
+                    
+                    seen_items.add(item_key)
+                    
+                    action_items.append({
                         'text': task,
-                        'assignee': assignee or '',
-                        'priority': self._determine_priority(sent.text),
-                        'category': self._categorize_task(task),
+                        'assignee': matched['name'],
+                        'assignee_email': matched.get('email', ''),
+                        'priority': 'medium',
+                        'category': category,
+                        'status': 'pending',
                         'completed': False,
-                        'source_sentence': sent.text,
-                        'confidence': confidence,
-                        'extraction_method': 'verb_phrase'
+                        'confidence': confidence
                     })
+                    
+                    logger.info(f"✓ {matched['name']} → {task[:50]}")
         
-        return items
-    
-    def _extract_concise_task(self, task_text: str, sent) -> str:
-        """Extract concise 2-4 word task description using NLP"""
-        if not task_text:
-            return ""
+        # Sort by confidence
+        action_items.sort(key=lambda x: x['confidence'], reverse=True)
         
-        # Parse the task text
-        task_doc = self.nlp(task_text.strip())
+        return action_items
+
+    def _smart_sentence_split(self, transcript: str) -> List[str]:
+        """Split transcript intelligently, preserving 'and Name' patterns"""
         
-        # Strategy 1: Get verb + main noun phrase
-        main_tokens = []
-        seen_lemmas = set()  # Track lemmas to avoid duplicates
-        found_verb = False
+        # First split on clear sentence boundaries
+        sentences = re.split(r'[.!?]+\s+', transcript)
         
-        for token in task_doc:
-            # Skip stopwords at the start
-            if not main_tokens and token.text.lower() in self.task_stopwords:
+        processed = []
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
                 continue
             
-            # Skip if we've already seen this lemma (avoid "documentation documentation")
-            if token.lemma_.lower() in seen_lemmas:
-                continue
+            # Check if sentence contains multiple "and Name," patterns
+            # This indicates chained assignments in one sentence
+            # Pattern matches: "and Name, you will" or "and Name will" or "and Name needs"
+            and_name_pattern = r'\s+and\s+(\w+(?:\s+\w+)?)[,\s]+(?:you\s+)?(?:will|needs|should)'
+            matches = list(re.finditer(and_name_pattern, sent, re.IGNORECASE))
             
-            # Collect action verb
-            if token.pos_ == 'VERB' and token.lemma_ in self.action_verbs:
-                main_tokens.append(token.lemma_)
-                seen_lemmas.add(token.lemma_.lower())
-                found_verb = True
-            # Collect main nouns and their modifiers
-            elif token.pos_ in ['NOUN', 'PROPN']:
-                # Get compound and modifiers
-                for child in token.children:
-                    if child.dep_ in ['compound', 'amod'] and child.lemma_.lower() not in seen_lemmas:
-                        main_tokens.append(child.text)
-                        seen_lemmas.add(child.lemma_.lower())
+            if len(matches) >= 1:
+                logger.info(f"Found {len(matches)} 'and Name' patterns in: {sent[:80]}...")
                 
-                if token.lemma_.lower() not in seen_lemmas:
-                    main_tokens.append(token.text)
-                    seen_lemmas.add(token.lemma_.lower())
-            # Include important adjectives
-            elif token.pos_ == 'ADJ' and token.head.pos_ == 'NOUN' and token.lemma_.lower() not in seen_lemmas:
-                main_tokens.append(token.text)
-                seen_lemmas.add(token.lemma_.lower())
-            
-            # Stop if we have enough tokens
-            if len(main_tokens) >= 4:
-                break
+                # Split the sentence at each "and Name," creating separate mini-sentences
+                # We'll create one sentence per assignment
+                split_pattern = r'(\s+and\s+\w+(?:\s+\w+)?[,\s]+(?:you\s+)?(?:will|needs|should)[^.]*?)(?=\s+and\s+\w+(?:\s+\w+)?[,\s]+(?:you\s+)?(?:will|needs|should)|$)'
+                
+                # First, get the part before the first "and Name"
+                first_match_start = matches[0].start()
+                if first_match_start > 0:
+                    first_part = sent[:first_match_start].strip()
+                    if first_part:
+                        processed.append(first_part)
+                        logger.info(f"  Split part 1: {first_part[:60]}...")
+                
+                # Now process each "and Name" section
+                for i, match in enumerate(matches):
+                    start = match.start()
+                    # Find where this section ends (either at next "and Name" or end of sentence)
+                    if i + 1 < len(matches):
+                        end = matches[i + 1].start()
+                    else:
+                        end = len(sent)
+                    
+                    section = sent[start:end].strip()
+                    # Remove leading "and" and clean up
+                    section = re.sub(r'^and\s+', '', section, flags=re.IGNORECASE).strip()
+                    
+                    if section:
+                        processed.append(section)
+                        logger.info(f"  Split part {i+2}: {section[:60]}...")
+            else:
+                processed.append(sent)
         
-        # Strategy 2: If no good tokens, extract noun chunks
-        if len(main_tokens) < 2:
-            for chunk in task_doc.noun_chunks:
-                words = chunk.text.split()
-                for word in words[:3]:
-                    lemma = self.nlp(word)[0].lemma_.lower()
-                    if lemma not in seen_lemmas:
-                        main_tokens.append(word)
-                        seen_lemmas.add(lemma)
-                if len(main_tokens) >= 3:
-                    break
+        return [s for s in processed if len(s.strip()) > 5]
+
+    def _clean_task(self, task: str, participant_map: Dict) -> str:
+        """Clean task text"""
+        # Remove leading conjunctions
+        task = re.sub(r'^(and|so|or|then|also)\s+', '', task, flags=re.IGNORECASE)
         
-        task = ' '.join(main_tokens[:4])  # Max 4 words
-        return self._clean_task_text(task)
-    
-    def _clean_task_text(self, task: str) -> str:
-        """Clean and normalize task text"""
-        if not task:
-            return ""
+        # Remove trailing conjunctions
+        task = re.sub(r'\s+(and|so|or|then)\s*$', '', task, flags=re.IGNORECASE)
         
-        # Remove extra whitespace
-        task = ' '.join(task.split())
+        # Remove "and Name will/needs/should" at the end
+        task = re.sub(r'\s+and\s+\w+(?:\s+\w+)?(?:\s+will|\s+needs|\s+should).*$', '', task, flags=re.IGNORECASE)
         
-        # Split into words and remove duplicates while preserving order
-        words = task.split()
-        seen = set()
-        unique_words = []
+        # Remove punctuation at the end
+        task = re.sub(r'[.,;:!?]+$', '', task).strip()
         
-        for word in words:
-            word_lower = word.lower()
-            # Skip stopwords at beginning/end positions
-            if not unique_words and word_lower in self.task_stopwords:
+        return task
+
+    def _contains_other_names(self, task: str, matched_participant: Dict, participant_map: Dict) -> bool:
+        """Check if task contains other participant names"""
+        task_lower = task.lower()
+        matched_name_lower = matched_participant['name'].lower()
+        
+        for pname in participant_map['all_names']:
+            if pname == matched_name_lower:
                 continue
-            # Skip duplicate words (case-insensitive)
-            if word_lower not in seen:
-                seen.add(word_lower)
-                unique_words.append(word)
+            
+            # Check full name and first name
+            if pname in task_lower:
+                return True
+            
+            # Check first name separately
+            first_name = pname.split()[0]
+            if first_name in task_lower.split():
+                return True
         
-        # Remove trailing stopwords
-        while unique_words and unique_words[-1].lower() in self.task_stopwords:
-            unique_words.pop()
+        return False
+
+    def _is_duplicate(self, task: str, assignee: str, action_items: List[Dict]) -> bool:
+        """Check if this is a duplicate action item"""
+        for existing in action_items:
+            if existing['assignee'].lower() == assignee.lower():
+                sim = SequenceMatcher(None, task.lower(), existing['text'].lower()).ratio()
+                if sim > 0.98:
+                    return True
+        return False
+
+    def _match_participant(self, name_mention: str, participant_map: Dict) -> Optional[Dict]:
+        """Match name to participant"""
+        name_lower = name_mention.lower().strip()
         
-        if not unique_words:
-            return ""
+        # Remove titles
+        name_clean = re.sub(r'^(dr\.|nurse|mr\.|ms\.|mrs\.)\s+', '', name_lower)
         
-        task = ' '.join(unique_words)
+        # Direct matches
+        if name_clean in participant_map['by_full_name']:
+            return participant_map['by_full_name'][name_clean]
         
-        # Remove phrases that indicate it's not a real task
-        invalid_phrases = ['that work', 'this work', 'it', 'them', 'that', 'this', 'next next week', 'last last time']
-        if task.lower() in invalid_phrases:
-            return ""
+        if name_clean in participant_map['by_first_name']:
+            return participant_map['by_first_name'][name_clean]
         
-        # Remove duplicate consecutive words like "next next"
-        task = re.sub(r'\b(\w+)\s+\1\b', r'\1', task, flags=re.IGNORECASE)
+        if name_clean in participant_map['by_last_name']:
+            return participant_map['by_last_name'][name_clean]
         
-        # Capitalize properly
-        words = task.split()
-        if words:
-            words[0] = words[0].capitalize()
-            # Keep proper nouns capitalized
-            for i in range(1, len(words)):
-                if words[i][0].isupper():
-                    continue
-                else:
-                    words[i] = words[i].lower()
+        # Fuzzy matching
+        best_match = None
+        best_score = 0.0
         
-        return ' '.join(words)
-    
-    def _calculate_confidence(self, sent, task: str, assignee: Optional[str], base_confidence: float) -> float:
-        """Calculate confidence score using multiple features"""
-        confidence = base_confidence
+        for pname in participant_map['all_names']:
+            score = SequenceMatcher(None, name_clean, pname).ratio()
+            if score > best_score:
+                best_score = score
+                best_match = participant_map['by_full_name'][pname]
         
-        # Feature 1: Has assignee (+0.1)
-        if assignee:
-            confidence += 0.1
+        if best_score >= 0.65:
+            return best_match
         
-        # Feature 2: Task contains action verb (+0.05)
-        task_lower = task.lower()
-        if any(verb in task_lower for verb in self.action_verbs):
-            confidence += 0.05
-        
-        # Feature 3: Sentence contains assignment signals (+0.05)
-        sent_lower = sent.text.lower()
-        for signal_type, signals in self.assignment_signals.items():
-            if any(signal in sent_lower for signal in signals):
-                confidence += 0.05
-                break
-        
-        # Feature 4: Task length is optimal (2-4 words) (+0.05)
-        word_count = len(task.split())
-        if 2 <= word_count <= 4:
-            confidence += 0.05
-        elif word_count == 1:
-            confidence -= 0.1
-        
-        # Feature 5: No question marks (-0.2)
-        if '?' in sent.text:
-            confidence -= 0.2
-        
-        # Feature 6: Sentence position (later in doc = higher confidence)
-        # (Would need full doc context, skipping for now)
-        
-        return min(1.0, max(0.0, confidence))
-    
-    def _is_valid_task(self, task: str) -> bool:
-        """Validate if task is meaningful"""
-        if not task or len(task) < 3:
-            return False
-        
-        words = task.lower().split()
-        
-        # Must have at least one meaningful word
-        meaningful_words = [w for w in words if w not in self.task_stopwords and len(w) > 2]
-        if len(meaningful_words) < 1:
-            return False
-        
-        # Check for invalid patterns
-        invalid_patterns = [
-            'work till', 'that work', 'this work', 'and prepare',
-            'next next', 'last last', 'did last', 'work next'
-        ]
-        task_lower = task.lower()
-        if any(inv in task_lower for inv in invalid_patterns):
-            return False
-        
-        # Don't allow single-word tasks unless they're very specific
-        if len(words) == 1 and words[0].lower() not in ['documentation', 'report', 'presentation', 'dashboard', 'testing']:
-            return False
-        
-        return True
-    
-    def _clean_assignee(self, name: str, person_names: Set[str]) -> Optional[str]:
-        """Clean and validate assignee name"""
-        if not name:
-            return None
-        
-        # Match against known person names
-        for person in person_names:
-            if person.lower() in name.lower():
-                return person
-        
-        # Clean common words
-        cleaned = re.sub(
-            r'\b(you|will|be|doing|the|and|to|is|are|a|an|have|has|we|need|must|should|by|for|working|on)\b',
-            '', name, flags=re.IGNORECASE
-        ).strip()
-        
-        cleaned = ' '.join(w.capitalize() for w in cleaned.split())
-        
-        if not cleaned or len(cleaned) < 2:
-            return None
-        
-        # Filter pronouns
-        if cleaned.lower() in ['we', 'us', 'they', 'them', 'i', 'me', 'you']:
-            return None
-        
-        return cleaned
-    
+        return None
+
     def _categorize_task(self, task: str) -> str:
-        """Categorize task based on content"""
+        """Categorize task"""
         task_lower = task.lower()
         
         categories = {
-            'Documentation': ['document', 'documentation', 'notes', 'record'],
-            'Presentation': ['presentation', 'present', 'powerpoint', 'slides', 'demo'],
-            'Development': ['develop', 'build', 'code', 'implement', 'create'],
-            'Testing': ['test', 'verify', 'validate', 'check', 'qa'],
-            'Maintenance': ['repair', 'fix', 'maintain', 'service', 'clean'],
-            'Research': ['research', 'investigate', 'study', 'analyze'],
-            'Planning': ['plan', 'schedule', 'organize', 'prepare'],
-            'Reporting': ['report', 'summary', 'dashboard', 'metrics', 'chart'],
-            'Communication': ['contact', 'email', 'call', 'notify', 'follow up'],
+            'Documentation': ['document', 'write', 'record', 'notes', 'paper', 'report', 'bibliography', 'research', 'records', 'medical records'],
+            'Presentation': ['presentation', 'present', 'slides', 'ppt', 'powerpoint', 'power point'],
+            'Development': ['develop', 'build', 'code', 'implement', 'create', 'design', 'mockup', 'frontend', 'backend'],
+            'Review': ['review', 'check', 'verify', 'validate', 'evaluate', 'audit', 'changes', 'lab results'],
+            'Communication': ['send', 'email', 'contact', 'call', 'outreach', 'media', 'relations', 'notify'],
+            'Planning': ['plan', 'schedule', 'organize', 'prepare', 'coordinate', 'discussion', 'fundraising', 'chapters', 'events', 'group'],
+            'Testing': ['test', 'qa', 'debug', 'quality', 'testing'],
+            'Deployment': ['deploy', 'deployment', 'release'],
+            'Healthcare': ['patient', 'medical', 'lab', 'pharmacy', 'evaluation', 'rounds', 'results'],
         }
         
         for category, keywords in categories.items():
             if any(kw in task_lower for kw in keywords):
                 return category
         
-        return "General"
-    
-    def _determine_priority(self, text: str) -> str:
-        """Determine priority from context"""
-        text_lower = text.lower()
-        
-        for priority, keywords in self.priority_keywords.items():
-            if any(kw in text_lower for kw in keywords):
-                return priority
-        
-        return "medium"
-    
-    def _clean_transcript(self, transcript: str) -> str:
-        """Clean transcript"""
-        cleaned = ' '.join(transcript.split())
-        cleaned = re.sub(r'\bmeet\b', 'meeting', cleaned, flags=re.IGNORECASE)
-        return cleaned
+        return 'General'
 
-# Global instance
+
 action_item_service = ActionItemService()

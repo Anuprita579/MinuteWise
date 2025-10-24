@@ -1,71 +1,78 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from motor.motor_asyncio import AsyncIOMotorClient
+import logging
 import os
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
-from app.routes import auth, meetings, transcription, jira, email
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+# Create FastAPI app
 app = FastAPI(
     title="Meeting Transcription API",
-    description="API for transcribing meeting audio files and extracting insights",
-    version="1.0.0",
-    docs_url="/docs",  # Swagger UI available at /docs
-    redoc_url="/redoc"  # ReDoc available at /redoc
+    description="API for meeting transcription, summarization, and action item extraction",
+    version="2.0.0"
 )
 
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://your-frontend-domain.com"  # Add your production domain
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create uploads directory if it doesn't exist
-os.makedirs("uploads", exist_ok=True)
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-
-# MongoDB connection
-@app.on_event("startup")
-async def startup_db_client():
-    app.mongodb_client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
-    app.mongodb = app.mongodb_client[os.getenv("DB_NAME", "meeting_transcription")]
-    print(f"Connected to MongoDB: {os.getenv('DB_NAME', 'meeting_transcription')}")
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    app.mongodb_client.close()
-    print("Disconnected from MongoDB")
-
-# Health check endpoint
-@app.get("/", tags=["health"])
-async def health_check():
-    return {"status": "healthy", "message": "Meeting Transcription API is running"}
+# Import routers
+from app.routes import transcription, email, jira, admin_edit
 
 # Include routers
-# app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
-# app.include_router(meetings.router, prefix="/api/meetings", tags=["Meetings"])
-# app.include_router(transcription.router, prefix="/api/transcription", tags=["Transcription"])
-# app.include_router(jira.router, prefix="/api/jira", tags=["jira"]) 
-# app.include_router(email.router, prefix="/api/email", tags=["email"])
-app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
-app.include_router(meetings.router, prefix="/meetings", tags=["Meetings"])
-app.include_router(transcription.router, prefix="/transcription", tags=["Transcription"])
-app.include_router(jira.router, prefix="/jira", tags=["jira"]) 
-app.include_router(email.router, prefix="/email", tags=["email"])
+app.include_router(transcription.router)
+app.include_router(email.router)
+app.include_router(jira.router)
+app.include_router(admin_edit.router)
 
+# Root endpoint
+@app.get("/")
+async def root():
+    return {
+        "message": "Meeting Transcription API",
+        "version": "2.0.0",
+        "status": "healthy",
+        "endpoints": {
+            "transcription": "/transcription",
+            "email": "/email",
+            "jira": "/jira",
+            "docs": "/docs"
+        }
+    }
 
+# Health check
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_KEY")),
+        "email_configured": bool(os.getenv("SMTP_EMAIL") and os.getenv("SMTP_PASSWORD")),
+        "jira_configured": bool(os.getenv("JIRA_EMAIL") and os.getenv("JIRA_API_TOKEN"))
+    }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        reload=True,  # Enable auto-reload for development
-        log_level="info"
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", 8000)),
+        reload=True
     )
