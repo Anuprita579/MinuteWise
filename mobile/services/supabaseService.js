@@ -221,7 +221,6 @@ export const supabaseService = {
     }
   },
 
-  // ✅ FIXED: Now accepts userId and sets first participant as admin
   async addParticipants(meetingId, participants, creatorUserId) {
     try {
       console.log(`📝 Adding ${participants.length} participants to meeting`);
@@ -344,7 +343,6 @@ export const supabaseService = {
     }
   },
 
-  // ✅ FIXED: Now passes userId to addParticipants
   async createMeetingWithParticipants(audioUri, title, participants, userId) {
     try {
       console.log('🚀 Starting complete meeting creation workflow');

@@ -16,7 +16,7 @@ SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_EMAIL = os.getenv("SMTP_EMAIL")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-APP_URL = os.getenv("APP_URL", "http://localhost:3000")
+APP_URL = os.getenv("APP_URL", "http://localhost:5173")
 
 
 class EmailService:

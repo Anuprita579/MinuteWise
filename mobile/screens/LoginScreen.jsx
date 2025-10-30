@@ -19,7 +19,7 @@ export default function LoginScreen({ navigation }) {
   const [name, setName] = useState('');
   const [loading, setLoading] = useState(false);
   const [isSignUp, setIsSignUp] = useState(false);
-  const { login, signUp, loginWithGoogle, googleRequest } = useAuth();
+  const { login, signUp, loginWithGoogle, googleRequest, resetPassword } = useAuth(); // ✅ Add resetPassword
 
   async function handleEmailAuth() {
     if (!email || !password) {
@@ -40,6 +40,7 @@ export default function LoginScreen({ navigation }) {
     
     setLoading(false);
 
+    // ✅ UPDATED: Handle all result cases
     if (result.success) {
       if (result.requiresConfirmation) {
         Alert.alert(
@@ -51,12 +52,77 @@ export default function LoginScreen({ navigation }) {
       } else {
         Alert.alert('Success', isSignUp ? 'Account created!' : 'Logged in successfully!');
       }
+    } else if (result.showResetPassword) {
+      // ✅ NEW: Handle case where user exists with Google but no password
+      Alert.alert(
+        'Account Exists',
+        result.error + '\n\nWould you like to set a password for this account?',
+        [
+          { 
+            text: 'Cancel', 
+            style: 'cancel' 
+          },
+          { 
+            text: 'Set Password', 
+            onPress: async () => {
+              setLoading(true);
+              const resetResult = await resetPassword(email);
+              setLoading(false);
+              
+              if (resetResult.success) {
+                Alert.alert(
+                  'Email Sent!',
+                  'Check your email for a password reset link. After setting your password, you can sign in on mobile.',
+                  [{ text: 'OK', onPress: () => setIsSignUp(false) }]
+                );
+              } else {
+                Alert.alert('Error', resetResult.error || 'Failed to send reset email');
+              }
+            }
+          }
+        ]
+      );
     } else {
+      // ✅ Handle other errors
       Alert.alert(
         isSignUp ? 'Sign Up Failed' : 'Login Failed', 
         result.error || 'Please try again'
       );
     }
+  }
+
+  // ✅ NEW: Add a "Forgot Password" button for login mode
+  async function handleForgotPassword() {
+    if (!email) {
+      Alert.alert('Enter Email', 'Please enter your email address first');
+      return;
+    }
+
+    Alert.alert(
+      'Reset Password',
+      `Send password reset email to ${email}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Send',
+          onPress: async () => {
+            setLoading(true);
+            const result = await resetPassword(email);
+            setLoading(false);
+
+            if (result.success) {
+              Alert.alert(
+                'Email Sent',
+                'Check your inbox for the password reset link',
+                [{ text: 'OK' }]
+              );
+            } else {
+              Alert.alert('Error', result.error || 'Failed to send reset email');
+            }
+          }
+        }
+      ]
+    );
   }
 
   return (
@@ -110,7 +176,15 @@ export default function LoginScreen({ navigation }) {
 
           {/* Password Input */}
           <View className="mb-6">
-            <Text className="text-white text-sm mb-2">Password</Text>
+            <View className="flex-row justify-between items-center mb-2">
+              <Text className="text-white text-sm">Password</Text>
+              {/* ✅ NEW: Forgot Password link (only in login mode) */}
+              {!isSignUp && (
+                <TouchableOpacity onPress={handleForgotPassword} disabled={loading}>
+                  <Text className="text-red-600 text-xs">Forgot Password?</Text>
+                </TouchableOpacity>
+              )}
+            </View>
             <TextInput
               className="bg-gray-800 text-white px-4 py-3 rounded-lg"
               placeholder="Enter your password"

@@ -1,0 +1,28 @@
+
+    MINUTEWISE - METRICS SUMMARY
+    Generated: 2025-10-28 22:48:56
+    
+    SYSTEM PERFORMANCE
+    ------------------
+    Total Meetings Processed: 3
+    Success Rate: 100.0%
+    Mean Processing Time: 617.59s
+    Mean Compression Ratio: 134.8%
+    
+    ACTION ITEM EXTRACTION
+    ----------------------
+    Total Action Items: 2
+    Avg per Meeting: 0.67
+    Avg Confidence: 0.99
+    
+    PARTICIPANT MATCHING
+    --------------------
+    Match Success Rate: 100.0%
+    Items with Assignee: 2
+    
+    USAGE STATISTICS
+    ----------------
+    Unique Users: 1
+    Web Uploads: 2
+    Mobile Uploads: 1
+    

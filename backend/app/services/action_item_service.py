@@ -1,13 +1,35 @@
 import re
+import json
 from typing import List, Dict, Optional
 from difflib import SequenceMatcher
 import logging
+import os
+import google.generativeai as genai
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class ActionItemService:
     def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+        # Initialize Gemini
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
+        self.use_gemini = bool(self.gemini_api_key)
+        
+        if self.use_gemini:
+            try:
+                genai.configure(api_key=self.gemini_api_key)
+                self.model = genai.GenerativeModel('gemini-pro')
+                logger.info("Gemini API initialized for action item extraction")
+            except Exception as e:
+                logger.error(f"Failed to initialize Gemini: {e}")
+                self.use_gemini = False
+        else:
+            logger.warning("Gemini API key not found, using rule-based extraction")
+        
         self.action_verbs = {
             'doing', 'create', 'handle', 'update', 'review', 'manage', 'prepare',
             'finalize', 'coordinate', 'organize', 'send', 'submit', 'deliver',
@@ -20,14 +42,139 @@ class ActionItemService:
         transcript: str, 
         participants: List[Dict]
     ) -> List[Dict]:
-        """Extract action items from transcript"""
+        """Extract action items from transcript using Gemini or fallback to rule-based"""
         if not transcript:
             return []
         
         participant_map = self._build_participant_map(participants)
-        action_items = self._extract_with_patterns(transcript, participant_map)
         
+        # Try Gemini first if available
+        if self.use_gemini:
+            try:
+                action_items = self._extract_with_gemini(transcript, participants, participant_map)
+                if action_items:
+                    logger.info(f"Successfully extracted {len(action_items)} action items with Gemini")
+                    return action_items
+            except Exception as e:
+                logger.error(f"Gemini extraction failed: {e}, falling back to rule-based")
+        
+        # Fallback to rule-based extraction
+        action_items = self._extract_with_patterns(transcript, participant_map)
         return action_items
+
+    def _extract_with_gemini(self, transcript: str, participants: List[Dict], participant_map: Dict) -> List[Dict]:
+        """Extract action items using Gemini API"""
+        
+        # Prepare participant list for the prompt
+        participant_list = "\n".join([f"- {p['name']} ({p.get('email', 'N/A')})" for p in participants])
+        
+        prompt = f"""You are analyzing a meeting transcript to extract action items. Be precise and only extract clear, actionable tasks.
+
+**Meeting Participants:**
+{participant_list}
+
+**Instructions:**
+1. Extract ONLY explicit action items where someone is assigned a specific task
+2. Each action item must have:
+   - A clear assignee (must be one of the participants listed above)
+   - A specific, actionable task description
+   - Appropriate priority (low, medium, or high)
+   - Relevant category
+3. DO NOT extract:
+   - General discussion points
+   - Questions without clear action
+   - Vague statements
+4. Use ONLY the participant names listed above
+5. Return valid JSON array format
+
+**Categories:** Documentation, Presentation, Development, Review, Communication, Planning, Testing, Deployment, Healthcare, General
+
+**Transcript:**
+{transcript}
+
+**Required JSON Format:**
+[
+  {{
+    "assignee": "Full Name from participant list",
+    "text": "Clear task description",
+    "priority": "low|medium|high",
+    "category": "Category from list above"
+  }}
+]
+
+Return ONLY the JSON array, no additional text."""
+
+        try:
+            response = self.model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Extract JSON from response (handle markdown code blocks)
+            if "```json" in response_text:
+                json_match = re.search(r'```json\s*(\[.*?\])\s*```', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(1)
+            elif "```" in response_text:
+                json_match = re.search(r'```\s*(\[.*?\])\s*```', response_text, re.DOTALL)
+                if json_match:
+                    response_text = json_match.group(1)
+            
+            # Parse JSON
+            extracted_items = json.loads(response_text)
+            
+            # Validate and enhance with participant details
+            validated_items = []
+            for item in extracted_items:
+                if not isinstance(item, dict):
+                    continue
+                
+                assignee_name = item.get('assignee', '').strip()
+                task_text = item.get('text', '').strip()
+                
+                if not assignee_name or not task_text or len(task_text) < 3:
+                    continue
+                
+                # Match participant
+                matched = self._match_participant(assignee_name, participant_map)
+                if not matched:
+                    logger.warning(f"Could not match participant: {assignee_name}")
+                    continue
+                
+                # Validate task doesn't contain other names
+                if self._contains_other_names(task_text, matched, participant_map):
+                    logger.info(f"Skipping - task contains other participant name: {task_text[:50]}")
+                    continue
+                
+                # Create action item
+                validated_item = {
+                    'text': task_text,
+                    'assignee': matched['name'],
+                    'assignee_email': matched.get('email', ''),
+                    'priority': item.get('priority', 'medium').lower(),
+                    'category': item.get('category', 'General'),
+                    'status': 'pending',
+                    'completed': False,
+                    'confidence': 0.95,  # High confidence for Gemini extractions
+                    'extraction_method': 'gemini'
+                }
+                
+                # Validate priority
+                if validated_item['priority'] not in ['low', 'medium', 'high']:
+                    validated_item['priority'] = 'medium'
+                
+                # Check for duplicates
+                if not self._is_duplicate(validated_item['text'], validated_item['assignee'], validated_items):
+                    validated_items.append(validated_item)
+                    logger.info(f"✓ Gemini: {validated_item['assignee']} → {validated_item['text'][:50]}")
+            
+            return validated_items
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Gemini JSON response: {e}")
+            logger.error(f"Response was: {response_text[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"Gemini extraction error: {e}")
+            return None
 
     def _build_participant_map(self, participants: List[Dict]) -> Dict:
         """Build participant lookup map"""
@@ -58,49 +205,28 @@ class ActionItemService:
         return participant_map
 
     def _extract_with_patterns(self, transcript: str, participant_map: Dict) -> List[Dict]:
-        """Extract action items using pattern matching"""
+        """Extract action items using pattern matching (fallback method)"""
         action_items = []
         seen_items = set()
         
-        # Enhanced patterns with better handling of "and" connectors
         patterns = [
-            # "Name, you will handle/do/be doing X" - for first person in sentence and split sections
             (r'^(\w+(?:\s+\w+)?),\s+you\s+will\s+(?:be\s+)?(?:handle|do|doing|working on)\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.99),
-            
-            # "Name will handle/do X" - with strict boundary
             (r'^(\w+(?:\s+\w+)?)\s+will\s+(?:handle|do|be doing)\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+(?:\s+\w+)?(?:\s+will|\s+needs)|\.|$)', 0.98),
-            
-            # "Name, you need/should X"
             (r'^(\w+(?:\s+\w+)?),\s+you\s+(?:need|should)\s+(?:to\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.98),
-            
-            # "Name, can you please X"
             (r'^(\w+(?:\s+\w+)?),\s+can\s+you\s+(?:please\s+)?(.+?)(?:\s+and\s+\w+|\?|$)', 0.97),
-            
-            # "Name will be working on X"
             (r'^(\w+(?:\s+\w+)?)\s+will\s+be\s+working\s+on\s+(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.97),
-            
-            # "Name will VERB X" - comprehensive verb list
             (r'^(\w+(?:\s+\w+)?)\s+will\s+(?:handle|create|manage|update|finalize|coordinate|organize|prepare|review|send|submit|deliver|check|verify|document|write|research|develop|build|design|test|schedule|contact|do|make|implement|complete|process|analyze)(?:\s+(?:the|a)\s+)?(.+?)(?:\s+and\s+\w+(?:\s+\w+)?(?:\s+will)|\.|$)', 0.96),
-            
-            # "Name needs to X"
             (r'^(\w+(?:\s+\w+)?)\s+needs?\s+to\s+(?:be\s+)?(?:do\s+)?(?:the\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.95),
-            
-            # "Name should X"
             (r'^(\w+(?:\s+\w+)?)\s+should\s+(?:be\s+)?(.+?)(?:\s+and\s+\w+|\.|$)', 0.94),
         ]
         
-        # Split transcript into processable chunks
-        # First, handle sentences that contain multiple assignments with "and"
         sentences = self._smart_sentence_split(transcript)
-        
-        logger.info(f"Processing {len(sentences)} sentences")
+        logger.info(f"Processing {len(sentences)} sentences with rule-based extraction")
         
         for sent in sentences:
-            # Skip noise
             if any(skip in sent.lower() for skip in ['hello', 'thank you', 'end of', 'starting', 'yeah', 'alright team', 'let\'s go']):
                 continue
             
-            # Try each pattern
             for pattern, confidence in patterns:
                 matches = re.finditer(pattern, sent, re.IGNORECASE)
                 
@@ -113,34 +239,24 @@ class ActionItemService:
                     assignee_name = groups[0].strip()
                     task = groups[1].strip()
                     
-                    # Clean task
                     task = self._clean_task(task, participant_map)
                     
-                    # Validate task
                     if not task or len(task) < 3:
                         continue
                     
-                    # Match participant
                     matched = self._match_participant(assignee_name, participant_map)
                     if not matched:
                         continue
                     
-                    # Validate task doesn't contain other names
                     if self._contains_other_names(task, matched, participant_map):
-                        logger.info(f"Skipping - task contains other participant name: {task[:50]}")
                         continue
                     
-                    # Categorize
                     category = self._categorize_task(task)
-                    
-                    # Create item key for dedup
                     item_key = f"{matched['name'].lower()}:{task.lower()[:50]}"
                     
-                    # Skip if already added (exact match)
                     if item_key in seen_items:
                         continue
                     
-                    # Check for very similar items (98%+)
                     if self._is_duplicate(task, matched['name'], action_items):
                         continue
                     
@@ -154,65 +270,47 @@ class ActionItemService:
                         'category': category,
                         'status': 'pending',
                         'completed': False,
-                        'confidence': confidence
+                        'confidence': confidence,
+                        'extraction_method': 'rule_based'
                     })
                     
-                    logger.info(f"✓ {matched['name']} → {task[:50]}")
+                    logger.info(f"✓ Pattern: {matched['name']} → {task[:50]}")
         
-        # Sort by confidence
         action_items.sort(key=lambda x: x['confidence'], reverse=True)
-        
         return action_items
 
     def _smart_sentence_split(self, transcript: str) -> List[str]:
-        """Split transcript intelligently, preserving 'and Name' patterns"""
-        
-        # First split on clear sentence boundaries
+        """Split transcript intelligently"""
         sentences = re.split(r'[.!?]+\s+', transcript)
-        
         processed = []
+        
         for sent in sentences:
             sent = sent.strip()
             if not sent:
                 continue
             
-            # Check if sentence contains multiple "and Name," patterns
-            # This indicates chained assignments in one sentence
-            # Pattern matches: "and Name, you will" or "and Name will" or "and Name needs"
             and_name_pattern = r'\s+and\s+(\w+(?:\s+\w+)?)[,\s]+(?:you\s+)?(?:will|needs|should)'
             matches = list(re.finditer(and_name_pattern, sent, re.IGNORECASE))
             
             if len(matches) >= 1:
-                logger.info(f"Found {len(matches)} 'and Name' patterns in: {sent[:80]}...")
-                
-                # Split the sentence at each "and Name," creating separate mini-sentences
-                # We'll create one sentence per assignment
-                split_pattern = r'(\s+and\s+\w+(?:\s+\w+)?[,\s]+(?:you\s+)?(?:will|needs|should)[^.]*?)(?=\s+and\s+\w+(?:\s+\w+)?[,\s]+(?:you\s+)?(?:will|needs|should)|$)'
-                
-                # First, get the part before the first "and Name"
                 first_match_start = matches[0].start()
                 if first_match_start > 0:
                     first_part = sent[:first_match_start].strip()
                     if first_part:
                         processed.append(first_part)
-                        logger.info(f"  Split part 1: {first_part[:60]}...")
                 
-                # Now process each "and Name" section
                 for i, match in enumerate(matches):
                     start = match.start()
-                    # Find where this section ends (either at next "and Name" or end of sentence)
                     if i + 1 < len(matches):
                         end = matches[i + 1].start()
                     else:
                         end = len(sent)
                     
                     section = sent[start:end].strip()
-                    # Remove leading "and" and clean up
                     section = re.sub(r'^and\s+', '', section, flags=re.IGNORECASE).strip()
                     
                     if section:
                         processed.append(section)
-                        logger.info(f"  Split part {i+2}: {section[:60]}...")
             else:
                 processed.append(sent)
         
@@ -220,18 +318,10 @@ class ActionItemService:
 
     def _clean_task(self, task: str, participant_map: Dict) -> str:
         """Clean task text"""
-        # Remove leading conjunctions
         task = re.sub(r'^(and|so|or|then|also)\s+', '', task, flags=re.IGNORECASE)
-        
-        # Remove trailing conjunctions
         task = re.sub(r'\s+(and|so|or|then)\s*$', '', task, flags=re.IGNORECASE)
-        
-        # Remove "and Name will/needs/should" at the end
         task = re.sub(r'\s+and\s+\w+(?:\s+\w+)?(?:\s+will|\s+needs|\s+should).*$', '', task, flags=re.IGNORECASE)
-        
-        # Remove punctuation at the end
         task = re.sub(r'[.,;:!?]+$', '', task).strip()
-        
         return task
 
     def _contains_other_names(self, task: str, matched_participant: Dict, participant_map: Dict) -> bool:
@@ -243,11 +333,9 @@ class ActionItemService:
             if pname == matched_name_lower:
                 continue
             
-            # Check full name and first name
             if pname in task_lower:
                 return True
             
-            # Check first name separately
             first_name = pname.split()[0]
             if first_name in task_lower.split():
                 return True
@@ -266,11 +354,8 @@ class ActionItemService:
     def _match_participant(self, name_mention: str, participant_map: Dict) -> Optional[Dict]:
         """Match name to participant"""
         name_lower = name_mention.lower().strip()
-        
-        # Remove titles
         name_clean = re.sub(r'^(dr\.|nurse|mr\.|ms\.|mrs\.)\s+', '', name_lower)
         
-        # Direct matches
         if name_clean in participant_map['by_full_name']:
             return participant_map['by_full_name'][name_clean]
         
@@ -280,7 +365,6 @@ class ActionItemService:
         if name_clean in participant_map['by_last_name']:
             return participant_map['by_last_name'][name_clean]
         
-        # Fuzzy matching
         best_match = None
         best_score = 0.0
         

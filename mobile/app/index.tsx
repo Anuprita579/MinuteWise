@@ -13,11 +13,12 @@ import BottomStack from "../components/BottomStack";
 import LoginScreen from "../screens/LoginScreen";
 import MeetingDetailScreen from "../screens/MeetingDetailScreen";
 import RecorderScreen from "../screens/RecorderScreen";
+import PasswordRecoveryScreen from "../screens/PasswordRecoveryScreen";
 
 const Stack = createStackNavigator();
 
 function AppNavigator() {
-  const { isAuthenticated, loading, user } = useAuth();
+  const { isAuthenticated, loading, user, isRecoveringPassword } = useAuth();
 
   // Show loader while checking auth status
   if (loading) {
@@ -30,12 +31,12 @@ function AppNavigator() {
   }
 
   // Debug log
-  console.log('Auth State:', { isAuthenticated, user: user?.email });
+  console.log('Auth State:', { isAuthenticated, user: user?.email, isRecoveringPassword });
 
   return (
     <>
-      {/* Only show header when authenticated */}
-      {isAuthenticated && <Header />}
+      {/* Only show header when authenticated and not recovering password */}
+      {isAuthenticated && !isRecoveringPassword && <Header />}
       
       <Stack.Navigator
         screenOptions={{ headerShown: false }}
@@ -43,6 +44,9 @@ function AppNavigator() {
         {!isAuthenticated ? (
           // Unauthenticated - show only login
           <Stack.Screen name="Login" component={LoginScreen} />
+        ) : isRecoveringPassword ? (
+          // Password recovery - show recovery screen
+          <Stack.Screen name="PasswordRecovery" component={PasswordRecoveryScreen} />
         ) : (
           // Authenticated - show all app screens
           <>
